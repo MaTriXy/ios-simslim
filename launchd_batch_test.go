@@ -77,16 +77,36 @@ func TestLaunchdJobPlistsMatchesTheLabelInside(t *testing.T) {
 // $FAKE_DIS holds disable overrides, $FAKE_LOADED the loaded jobs. It answers
 // `launchctl unload -w <plists...>` the way launchd does: override set, job
 // gone. Labels listed in $FAKE_STUCK get the override but stay loaded, and
-// FAKE_SLOW_UNLOAD makes every unload outlast its spawn timeout.
+// FAKE_SLOW_UNLOAD makes every unload outlast its spawn timeout. `load -w`
+// lifts each override and loads the job, `enable` lifts one override, and
+// `bootstrap` loads one job unless it is still disabled; labels listed in
+// $FAKE_NOLOAD never load in this boot session. FAKE_STATE overrides the
+// device state the listing reports. While $FAKE_TEARDOWN holds a positive
+// count, each spawn uses one up and fails with launchd_sim's error 124, the
+// way a simulator answers while its boot session starts or tears down.
+// FAKE_SPAWN_ERROR makes every spawn fail with another error, and FAKE_HANG
+// makes every spawn hang with a child process that keeps the output pipe open,
+// the way simctl outlives a killed xcrun; FAKE_HANG_ONCE names a file whose
+// presence makes only the next spawn hang that way.
 const fakeBatchXcrun = `#!/bin/sh
 printf '%s\n' "$*" >> "$FAKE_LOG"
 case "$1 $2 $3" in
   "simctl list runtimes") printf '{"runtimes":[{"identifier":"com.apple.CoreSimulator.SimRuntime.%s","runtimeRoot":"%s"}]}\n' "$FAKE_RUNTIME" "$FAKE_ROOT"; exit 0 ;;
-  "simctl list devices")  printf '{"devices":{"com.apple.CoreSimulator.SimRuntime.%s":[{"udid":"%s","name":"Batch","state":"Booted","isAvailable":true,"dataPath":"/tmp/batch"}]}}\n' "$FAKE_RUNTIME" "$FAKE_UDID"; exit 0 ;;
+  "simctl list devices")  printf '{"devices":{"com.apple.CoreSimulator.SimRuntime.%s":[{"udid":"%s","name":"Batch","state":"%s","isAvailable":true,"dataPath":"/tmp/batch"}]}}\n' "$FAKE_RUNTIME" "$FAKE_UDID" "${FAKE_STATE:-Booted}"; exit 0 ;;
 esac
 case "$1 $2" in
   "simctl boot"|"simctl bootstatus") exit 0 ;;
-  "simctl spawn") shift 3 ;;
+  "simctl spawn")
+    shift 3
+    n=$(cat "$FAKE_TEARDOWN" 2>/dev/null || echo 0)
+    if [ "$n" -gt 0 ]; then
+      echo $((n - 1)) > "$FAKE_TEARDOWN"
+      echo "An error was encountered processing the command (domain=com.apple.CoreSimulator.LaunchdSimError, code=124): Domain is tearing down" >&2
+      exit 124
+    fi
+    [ -n "$FAKE_SPAWN_ERROR" ] && { echo "Invalid device state" >&2; exit 1; }
+    [ -n "$FAKE_HANG" ] && { sleep 10 & exec sleep 10; }
+    [ -n "$FAKE_HANG_ONCE" ] && [ -e "$FAKE_HANG_ONCE" ] && { rm -f "$FAKE_HANG_ONCE"; sleep 10 & exec sleep 10; } ;;
   *) exit 99 ;;
 esac
 verb=$2
@@ -100,6 +120,18 @@ case "$verb" in
       l=${p##*/}; l=${l%.plist}; : > "$FAKE_DIS/$l"
       grep -qx "$l" "$FAKE_STUCK" 2>/dev/null || rm -f "$FAKE_LOADED/$l"
     done ;;
+  load)
+    shift 3
+    for p in "$@"; do
+      l=${p##*/}; l=${l%.plist}; rm -f "$FAKE_DIS/$l"
+      grep -qx "$l" "$FAKE_NOLOAD" 2>/dev/null || : > "$FAKE_LOADED/$l"
+    done ;;
+  enable) l=${3#system/}; rm -f "$FAKE_DIS/$l" ;;
+  bootstrap)
+    l=${4##*/}; l=${l%.plist}
+    [ -e "$FAKE_DIS/$l" ] && exit 5
+    grep -qx "$l" "$FAKE_NOLOAD" 2>/dev/null && exit 5
+    : > "$FAKE_LOADED/$l" ;;
   disable) l=${3#system/}; : > "$FAKE_DIS/$l" ;;
   bootout) l=${3#system/}; rm -f "$FAKE_LOADED/$l" ;;
   *) exit 99 ;;
@@ -110,18 +142,20 @@ exit 0
 // batchFake is a booted simulator whose launchd state lives in files, with a
 // RuntimeRoot holding a job plist for every label except withoutPlist.
 type batchFake struct {
-	udid, dis, loaded, stuck, log string
+	udid, dis, loaded, stuck, noload, teardown, log string
 }
 
 func newBatchFake(t *testing.T, runtime string, labels []string, withoutPlist string) batchFake {
 	t.Helper()
 	dir := t.TempDir()
 	f := batchFake{
-		udid:   "00000000-0000-0000-0000-0000000000B1",
-		dis:    filepath.Join(dir, "dis"),
-		loaded: filepath.Join(dir, "loaded"),
-		stuck:  filepath.Join(dir, "stuck"),
-		log:    filepath.Join(dir, "calls.log"),
+		udid:     "00000000-0000-0000-0000-0000000000B1",
+		dis:      filepath.Join(dir, "dis"),
+		loaded:   filepath.Join(dir, "loaded"),
+		stuck:    filepath.Join(dir, "stuck"),
+		noload:   filepath.Join(dir, "noload"),
+		teardown: filepath.Join(dir, "teardown"),
+		log:      filepath.Join(dir, "calls.log"),
 	}
 	root := filepath.Join(dir, "RuntimeRoot")
 	for _, d := range []string{f.dis, f.loaded} {
@@ -145,6 +179,8 @@ func newBatchFake(t *testing.T, runtime string, labels []string, withoutPlist st
 	t.Setenv("FAKE_DIS", f.dis)
 	t.Setenv("FAKE_LOADED", f.loaded)
 	t.Setenv("FAKE_STUCK", f.stuck)
+	t.Setenv("FAKE_NOLOAD", f.noload)
+	t.Setenv("FAKE_TEARDOWN", f.teardown)
 	t.Setenv("FAKE_ROOT", root)
 	t.Setenv("FAKE_RUNTIME", runtime)
 	t.Setenv("FAKE_UDID", f.udid)

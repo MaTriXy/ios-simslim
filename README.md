@@ -94,6 +94,8 @@ simslim profiles <id>    # the launchd labels in one category
 simslim on <udid>        # slim a simulator and reboot it slim
 simslim on <udid> --no-reboot   # slim the current boot session, no reboot
 simslim off <udid>       # put it back to stock
+simslim enable <udid> icloud,photos   # turn services back on now, no reboot
+simslim disable <udid> icloud         # turn them off again now
 simslim status <udid>    # managed launchd-label state (not a process count)
 simslim verify <udid> --profile ci.json   # exact profile match; non-zero on drift
 simslim doctor <udid> --requires push,storekit,universal-links
@@ -111,8 +113,8 @@ simslim erase <udid>     # erase apps, data, settings, and slimming overrides
 simslim delete <udid>    # permanently delete a simulator
 ```
 
-Read-only and simulator-management commands accept `--json` for integrations
-and the macOS app.
+Read-only and simulator-management commands, `enable`, and `disable` accept
+`--json` for integrations and the macOS app.
 
 Keep a category you actually need, like Spotlight search:
 
@@ -273,7 +275,53 @@ reads such a simulator, and `status --json` carries a `persistent` field.
 
 Live slimming only moves toward more-disabled. Managed daemons already disabled
 beyond the profile are left alone, because starting a daemon again live would
-need a per-label bootstrap; `simslim off` restores them with a reboot.
+need a per-label bootstrap; `simslim enable` turns them back on without a
+reboot, and `simslim off` restores them all with one.
+
+### Turning services back on without a reboot
+
+A slim simulator sometimes needs a feature back for a while: iCloud for a sync
+test, Photos for a picker. `enable` turns categories (IDs from
+`simslim profiles`) or individual managed daemons back on in the running
+simulator, with no reboot, and `disable` turns them off again.
+
+```sh
+simslim enable <udid> icloud,photos       # or: simslim enable <udid> icloud com.apple.apsd
+simslim doctor <udid> --requires icloud   # ok at once
+simslim disable <udid> icloud             # off again, still no reboot
+```
+
+`enable` lifts each disable override and loads the job into the current boot
+session. One `launchctl load -w` with the job plists from the runtime does most
+of them; any daemon still disabled then gets its own `launchctl enable`, and any
+still not loaded its own `launchctl bootstrap`. Everything is read back. A
+daemon launchd re-enables but will not load mid-session (iOS 27's
+`cloudsettingssyncagent`, for one) starts at the next boot, and the command
+says so and lists it (`notStarted` in `--json`). `disable` stops what you name
+the way `on --no-reboot` does, whatever the profile says, except a daemon the
+platform needs and, for a category, a daemon shared with another category that
+is fully enabled right now: `disable store` leaves the AMS daemons running while
+iCloud is on. A daemon you name on its own is always stopped. `disable` lists
+what it kept running (`stillEnabled` in `--json`).
+
+Like `on --no-reboot`, both act on the running boot session only and keep no
+state: the profile stays the one description of a slim simulator, so the next
+`on` or `watch` pass applies its profile again, and `verify` compares against
+the profile alone. They need a booted simulator. To go back to the profile
+without a reboot, run `simslim on <udid> --no-reboot --profile ci.json`.
+
+To make a change last, add `--save <profile.json>`: the command also adds the
+category to the file's `except` (a daemon to its `keep`), or removes it. A
+missing file is created from the default profile, the one `on` uses without
+`--profile`; entries keep their order and are never listed twice. Then `on`,
+`watch`, and `verify` with that profile agree with what you enabled. On a
+simulator that is not booted, `--save` only writes the file; apply it with
+`simslim on <udid> --profile <profile.json>`.
+
+```sh
+simslim enable <udid> icloud --save dev.json   # on now, and in dev.json
+simslim watch --profile dev.json               # keeps iCloud on at every boot
+```
 
 ### Slimming parallel-testing clones
 
@@ -367,7 +415,9 @@ func main() {
 The package never writes to stdout — it returns values and reports progress
 through the `simslim.Reporter` callback you pass in. `simslim.Categories`,
 `simslim.Features`, and `simslim.SlimmableSet()` expose the same allowlist the
-CLI uses. macOS only, since everything runs through `xcrun simctl`.
+CLI uses; `simslim.EnableServices`, `simslim.DisableServices`, and
+`simslim.SaveServices` back `enable`, `disable`, and `--save`. macOS only,
+since everything runs through `xcrun simctl`.
 
 ## How it works
 

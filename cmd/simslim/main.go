@@ -900,6 +900,101 @@ func cmdOff(ctx context.Context, cmd *cli.Command) error {
 	return nil
 }
 
+// cmdEnable re-enables categories or daemons on a booted simulator without a
+// reboot; --save also records them in a profile file.
+func cmdEnable(ctx context.Context, cmd *cli.Command) error {
+	jsonOutput := cmd.Bool("json")
+	udid, ids, err := udidAndIDs(cmd.Args().Slice())
+	if err != nil {
+		return err
+	}
+	tctx, cancel := context.WithTimeout(ctx, simslim.BootTimeout)
+	defer cancel()
+	out, err := simslim.EnableServices(tctx, udid, ids, cmd.String("save"), progress(jsonOutput))
+	if err != nil {
+		return err
+	}
+	if jsonOutput {
+		return writeJSON(out)
+	}
+	if out.Live {
+		fmt.Printf("Enabled %d services on %s without a reboot.\n", len(out.Labels), udid)
+	}
+	if len(out.NotStarted) > 0 {
+		fmt.Printf("  launchd starts %d of them at the next boot, not in this one: %s\n", len(out.NotStarted), strings.Join(out.NotStarted, ", "))
+	}
+	printSaved(out)
+	return nil
+}
+
+// cmdDisable is the inverse of enable: it stops categories or daemons on a
+// booted simulator now, without a reboot; --save also removes them from a
+// profile file.
+func cmdDisable(ctx context.Context, cmd *cli.Command) error {
+	jsonOutput := cmd.Bool("json")
+	udid, ids, err := udidAndIDs(cmd.Args().Slice())
+	if err != nil {
+		return err
+	}
+	tctx, cancel := context.WithTimeout(ctx, simslim.BootTimeout)
+	defer cancel()
+	out, err := simslim.DisableServices(tctx, udid, ids, cmd.String("save"), progress(jsonOutput))
+	if err != nil {
+		return err
+	}
+	if jsonOutput {
+		return writeJSON(out)
+	}
+	switch {
+	case !out.Live:
+	case len(out.Labels) == 0:
+		fmt.Printf("Nothing to stop on %s.\n", udid)
+	default:
+		fmt.Printf("Stopped %d services on %s without a reboot.\n", len(out.Labels), udid)
+	}
+	if len(out.StillEnabled) > 0 {
+		fmt.Printf("  %d stay enabled for another fully enabled category or the platform: %s\n", len(out.StillEnabled), strings.Join(out.StillEnabled, ", "))
+	}
+	printSaved(out)
+	return nil
+}
+
+// printSaved closes enable and disable with what persists: the saved profile,
+// or a reminder that the next `on` or `watch` pass applies its profile again.
+func printSaved(out simslim.ServicesOutput) {
+	switch {
+	case out.Saved == "":
+		fmt.Println("This lasts until the next `on` or `watch` pass; pass --save <profile.json> to keep it in a profile.")
+	case out.Live:
+		fmt.Printf("Saved to %s. Apply it later with `simslim on %s --profile %s`.\n", out.Saved, out.UDID, out.Saved)
+	default:
+		fmt.Printf("Saved to %s; nothing was applied, the simulator is not booted. Apply it with `simslim on %s --profile %s`.\n", out.Saved, out.UDID, out.Saved)
+	}
+}
+
+// udidAndIDs reads `<udid> [ids...]`, where each ID argument may itself be a
+// comma-separated list, as in `simslim enable <udid> icloud,photos`. The
+// library says when the IDs are missing.
+func udidAndIDs(args []string) (string, []string, error) {
+	if len(args) == 0 {
+		return "", nil, fmt.Errorf("expected a simulator UDID (see `simslim list`), then category IDs or launchd labels (see `simslim profiles`)")
+	}
+	var ids []string
+	for _, arg := range args[1:] {
+		ids = append(ids, simslim.SplitList(arg)...)
+	}
+	return args[0], ids, nil
+}
+
+// progress reports to stderr, except under --json, where consumers reading a
+// combined stream must get clean JSON.
+func progress(jsonOutput bool) simslim.Reporter {
+	if jsonOutput {
+		return nil
+	}
+	return func(msg string) { fmt.Fprintln(os.Stderr, msg) }
+}
+
 func returnToShutdown(ctx context.Context, set, udid string) error {
 	shutdownCtx, cancel := context.WithTimeout(ctx, simslim.ShutdownTimeout)
 	defer cancel()
@@ -989,6 +1084,20 @@ COMMANDS
   off <udid>           Restore a simulator to stock (re-enable + reboot)
       --preserve-boot-state
                        Return an initially shutdown simulator to shutdown
+  enable <udid> <ids>  Re-enable categories or individual daemons on a booted
+                       simulator now, without a reboot. IDs are category IDs
+                       or launchd labels, comma- or space-separated. Like
+                       ` + "`on --no-reboot`" + `, it lasts until the next ` + "`on`" + ` or ` + "`watch`" + `
+                       pass applies its profile again
+      --save path      Also add them to this profile file ("except" for a
+                       category, "keep" for a daemon), creating it from the
+                       default profile if needed; on a simulator that is not
+                       booted, only the file changes
+  disable <udid> <ids> Stop categories or daemons on a booted simulator now,
+                       without a reboot. A daemon shared with another category
+                       that is fully enabled keeps running. To go back to a
+                       profile, run ` + "`on <udid> --no-reboot --profile path`" + `
+      --save path      Also remove them from this profile file
   watch                Slim every simulator no-reboot as it boots, until Ctrl-C.
                        The hook for xcodebuild parallel-testing clones, which are
                        created stock and deleted per run; point --set at the
@@ -1034,11 +1143,15 @@ COMMANDS
   erase <udid>         Erase a simulator's apps, data, and settings
   delete <udid>        Permanently delete a simulator
       --json           Print machine-readable JSON (also supported by list,
-                       profiles, status, and simulator-management commands)
+                       profiles, status, verify, doctor, enable, disable, and
+                       simulator-management commands)
   version              Print the version
 
 Disabling is persistent (stored in the simulator's launchd overrides) and fully
 reversible with ` + "`simslim off`" + `. Deadlock-prone daemons are never touched.
+` + "`simslim enable`" + ` and ` + "`simslim disable`" + ` change a booted simulator live and keep
+no state; with --save they also edit a profile, the only record of a slim
+simulator, which ` + "`on`" + `, ` + "`watch`" + `, and ` + "`verify`" + ` read back.
 
 A ` + "`--profile`" + ` file is JSON you commit alongside your project and apply per run
 (for example a ci.json and a dev.json). Its "except" and "keep" arrays match the
